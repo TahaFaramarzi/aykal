@@ -1,0 +1,149 @@
+# اجرا:  cp .env.example .env  (پر کردن)  ←  docker compose up --build
+name: aykal
+
+x-db-url: &db-url postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/icall_db
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: icall_db
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # اسکیمای مشترک فقط هنگام اولین ساخت دیتابیس اجرا می‌شود
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d icall_db"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+
+  # ---------- ماژول ۱: دریافت webhook متا و سرنخ‌یابی ----------
+  module1:
+    build: ./services/module1_harvester
+    restart: unless-stopped
+    ports: ["8001:8001"]     # ← این پورت (از طریق HTTPS عمومی) آدرس Webhook متاست: /webhook
+    depends_on: { db: { condition: service_healthy }, redis: { condition: service_started } }
+    environment: &m1-env
+      DATABASE_URL: *db-url
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      REDIS_URL: redis://redis:6379/0
+      META_MODE: ${META_MODE:-local}
+      META_APP_SECRET: ${META_APP_SECRET:-local-dev-secret}
+      WEBHOOK_VERIFY_TOKEN: ${WEBHOOK_VERIFY_TOKEN:-local-verify}
+      IG_ACCESS_TOKEN: ${IG_ACCESS_TOKEN:-}
+      IG_USER_ID: ${IG_USER_ID:-}
+      API_KEY: ${API_KEY}
+      LLM_ENABLED: ${LLM_ENABLED:-true}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434/v1}
+      LLM_MODEL: ${LLM_MODEL:-llama3.2}
+      LLM_API_KEY: ${LLM_API_KEY:-ollama}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      MODULE4_URL: http://module4:8004
+      MODULE4_WEBHOOK_URL: http://module4:8004/instagram/webhook
+
+  module1_worker:
+    build: ./services/module1_harvester
+    restart: unless-stopped
+    command: celery -A app.tasks.celery_app.celery_app worker --loglevel=info
+    depends_on: [module1]
+    environment: *m1-env
+
+  module1_beat:
+    build: ./services/module1_harvester
+    restart: unless-stopped
+    command: celery -A app.tasks.celery_app.celery_app beat --loglevel=info
+    depends_on: [module1]
+    environment: *m1-env
+
+  # ---------- ماژول ۲: پایش تعامل و تشخیص ریزش ----------
+  module2:
+    build: ./services/module2_tracker
+    restart: unless-stopped
+    ports: ["8002:8002"]
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      DATABASE_URL: *db-url
+      API_KEY: ${API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434/v1}
+      LLM_MODEL: ${LLM_MODEL:-llama3.2}
+      LLM_API_KEY: ${LLM_API_KEY:-ollama}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+  # همگام‌سازی دوره‌ای: interactions ← inactive_users (هر ساعت)
+  module2_sync:
+    build: ./services/module2_tracker
+    restart: unless-stopped
+    command: python -m app.db_sync --loop 3600
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      DATABASE_URL: *db-url
+
+  # ---------- ماژول ۳: بازاریابی مجدد (خروجی: پیشنهاد برای اپراتور) ----------
+  module3:
+    build: ./services/module3_retargeting
+    restart: unless-stopped
+    ports: ["8003:8003"]
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      DATABASE_URL: *db-url
+      API_KEY: ${API_KEY}
+      RETARGETING_INTERVAL_SECONDS: 600
+
+  # ---------- ماژول ۴: دستیار گفتگوی هوشمند ----------
+  module4:
+    build: ./services/module4_agent
+    restart: unless-stopped
+    ports: ["8004:8004"]
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      DATABASE_URL: *db-url
+      ADMIN_API_KEY: ${API_KEY}
+      META_MODE: ${META_MODE:-local}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434/v1}
+      LLM_MODEL: ${LLM_MODEL:-llama3.2}
+      LLM_API_KEY: ${LLM_API_KEY:-ollama}
+      OPENAI_MODEL: ${LLM_MODEL:-llama3.2}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-lexical}
+      INSTAGRAM_VERIFY_TOKEN: ${WEBHOOK_VERIFY_TOKEN:-local-verify}
+      INSTAGRAM_APP_SECRET: ${META_APP_SECRET:-local-dev-secret}
+      INSTAGRAM_ACCESS_TOKEN: ${IG_ACCESS_TOKEN:-}
+      INSTAGRAM_API_VERSION: ${INSTAGRAM_API_VERSION:-v25.0}
+
+  # مدل زبانی محلی — هیچ کلید ابری لازم نیست
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports: ["11434:11434"]
+    volumes:
+      - ollama_data:/root/.ollama
+
+  ollama_pull:
+    image: ollama/ollama:latest
+    depends_on: [ollama]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "llama3.2"]
+    restart: "no"
+
+  # صندوق پیام شبیه‌سازی‌شده (جایگزین اینستاگرام برای دمو)
+  inbox:
+    build: ./apps/inbox
+    restart: unless-stopped
+    ports: ["8501:8501"]
+    depends_on: [module1, module4]
+    environment:
+      MODULE1_URL: http://module1:8001
+      MODULE4_URL: http://module4:8004
+      META_APP_SECRET: ${META_APP_SECRET:-local-dev-secret}
+      API_KEY: ${API_KEY}
+
+volumes:
+  pgdata:
+  ollama_data:

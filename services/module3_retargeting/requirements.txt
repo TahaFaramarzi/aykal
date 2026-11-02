@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+pytest
+psycopg[binary]
+psycopg_pool
+python-dotenv
+psycopg2-binary

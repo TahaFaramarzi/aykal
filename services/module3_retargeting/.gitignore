@@ -1,0 +1,7 @@
+.env
+test/
+app/__pycache__/
+app/database/__pycache__/
+app/modules/__pycache__/
+.venv
+retargeting_test_schema.sql
